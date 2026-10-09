@@ -13,6 +13,7 @@ OVMF_VARS*.fd
 
 # clangd index cache
 .cache/
+.clangd
 
 # Editor and OS junk
 .vscode/

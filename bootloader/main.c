@@ -149,6 +149,18 @@ typedef struct {
     uint64_t p_align;
 } Elf64_Phdr;
 
+/* The contract with the kernel. Must match kernel/kernel.c exactly. */
+struct boot_info {
+    uint32_t *fb;
+    uint32_t width;
+    uint32_t height;
+    uint32_t stride;
+};
+
+/* The kernel is built for System V; we are built for Microsoft's ABI.
+   This attribute makes clang pass the argument in rdi, not rcx. */
+typedef void (__attribute__((sysv_abi)) *kernel_entry_t)(struct boot_info *info);
+
 static void print(struct EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *out,
                   const CHAR16 *s) {
     out->output_string(out, s);
@@ -197,10 +209,10 @@ __attribute__((noreturn)) static void fail(
 
 EFI_STATUS efi_main(EFI_HANDLE image_handle,
                     struct EFI_SYSTEM_TABLE *system_table) {
-    (void)image_handle;
-
     struct EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *out = system_table->con_out;
     struct EFI_BOOT_SERVICES *bs = system_table->boot_services;
+
+    /* ---- 1. Read kernel.elf from the ESP ---- */
 
     static EFI_GUID fs_guid = {
         0x964e5b22, 0x6459, 0x11d2,
@@ -244,7 +256,8 @@ EFI_STATUS efi_main(EFI_HANDLE image_handle,
     print_u64(out, size);
     print(out, L" bytes\r\n");
 
-    /* Never trust the file: check everything before following it. */
+    /* ---- 2. Validate the ELF: never trust the file ---- */
+
     if (size < sizeof(Elf64_Ehdr)) {
         fail(out, L"file too small for ELF header", size);
     }
@@ -270,28 +283,10 @@ EFI_STATUS efi_main(EFI_HANDLE image_handle,
 
     print(out, L"Entry point: ");
     print_hex(out, eh->e_entry);
-    print(out, L"\r\nProgram headers: ");
-    print_u64(out, eh->e_phnum);
     print(out, L"\r\n");
 
-    for (uint16_t i = 0; i < eh->e_phnum; i++) {
-        Elf64_Phdr *ph = (Elf64_Phdr *)((uint8_t *)file_buf + eh->e_phoff +
-                                        (uint64_t)i * eh->e_phentsize);
+    /* ---- 3. Load every PT_LOAD segment to its physical address ---- */
 
-        print(out, L"  type ");
-        print_hex(out, ph->p_type);
-        print(out, L"  offset ");
-        print_hex(out, ph->p_offset);
-        print(out, L"\r\n        paddr ");
-        print_hex(out, ph->p_paddr);
-        print(out, L"  filesz ");
-        print_u64(out, ph->p_filesz);
-        print(out, L"  memsz ");
-        print_u64(out, ph->p_memsz);
-        print(out, L"\r\n");
-    }
-
-    /* Load every PT_LOAD segment to its physical address. */
     for (uint16_t i = 0; i < eh->e_phnum; i++) {
         Elf64_Phdr *ph = (Elf64_Phdr *)((uint8_t *)file_buf + eh->e_phoff +
                                         (uint64_t)i * eh->e_phentsize);
@@ -326,19 +321,74 @@ EFI_STATUS efi_main(EFI_HANDLE image_handle,
             dst[n] = 0;
         }
 
-        int ok = 1;
-        for (uint64_t n = 0; n < ph->p_filesz; n++) {
-            if (dst[n] != src[n]) {
-                ok = 0;
-            }
-        }
-
         print(out, L"Loaded segment at ");
         print_hex(out, ph->p_paddr);
-        print(out, L", pages ");
-        print_u64(out, pages);
-        print(out, ok ? L", copy check: OK\r\n" : L", copy check: BAD\r\n");
+        print(out, L"\r\n");
     }
+
+    /* ---- 4. Find the framebuffer and fill in boot_info ---- */
+
+    static EFI_GUID gop_guid = {
+        0x9042a9de, 0x23dc, 0x4a38,
+        {0x96, 0xfb, 0x7a, 0xde, 0xd0, 0x80, 0x51, 0x6a}};
+
+    EFI_GRAPHICS_OUTPUT_PROTOCOL *gop = 0;
+    status = bs->locate_protocol(&gop_guid, 0, (void **)&gop);
+    if (status != 0) {
+        fail(out, L"locate graphics output", status);
+    }
+
+    static struct boot_info info;
+    info.fb = (uint32_t *)gop->mode->frame_buffer_base;
+    info.width = gop->mode->info->horizontal_resolution;
+    info.height = gop->mode->info->vertical_resolution;
+    info.stride = gop->mode->info->pixels_per_scan_line;
+
+    /* Copy the entry point out now: after the exit we want no
+       dependence on firmware-owned structures. */
+    uint64_t entry = eh->e_entry;
+
+    print(out, L"Handing off to the kernel...\r\n");
+
+    /* ---- 5. Memory map + ExitBootServices ---- */
+
+    UINTN map_size = 0;
+    UINTN map_key = 0;
+    UINTN desc_size = 0;
+    uint32_t desc_version = 0;
+
+    bs->get_memory_map(&map_size, 0, &map_key, &desc_size, &desc_version);
+
+    UINTN map_buf_size = map_size + 2 * desc_size;
+    void *map = 0;
+    status = bs->allocate_pool(2, map_buf_size, &map);
+    if (status != 0) {
+        fail(out, L"allocate memory map buffer", status);
+    }
+
+    /* Fetch the map and exit immediately. Retry if the map went stale. */
+    int exited = 0;
+    for (int tries = 0; tries < 5 && !exited; tries++) {
+        map_size = map_buf_size;
+        status = bs->get_memory_map(&map_size, map, &map_key,
+                                    &desc_size, &desc_version);
+        if (status != 0) {
+            fail(out, L"get_memory_map", status);
+        }
+        status = bs->exit_boot_services(image_handle, map_key);
+        if (status == 0) {
+            exited = 1;
+        }
+    }
+
+    if (!exited) {
+        fail(out, L"ExitBootServices", status);
+    }
+
+    /* ---- 6. Boot services are gone. No print(). Jump. ---- */
+
+    kernel_entry_t kmain = (kernel_entry_t)entry;
+    kmain(&info);
 
     halt();
 }
