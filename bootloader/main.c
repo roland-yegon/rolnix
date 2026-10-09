@@ -58,6 +58,24 @@ typedef struct {
     EFI_GRAPHICS_OUTPUT_PROTOCOL_MODE *mode;
 } EFI_GRAPHICS_OUTPUT_PROTOCOL;
 
+struct EFI_FILE_PROTOCOL {
+    uint64_t revision;
+    EFI_STATUS (*open)(struct EFI_FILE_PROTOCOL *self,
+                       struct EFI_FILE_PROTOCOL **new_handle,
+                       const CHAR16 *name, uint64_t mode,
+                       uint64_t attributes);
+    EFI_STATUS (*close)(struct EFI_FILE_PROTOCOL *self);
+    void *delete_file;
+    EFI_STATUS (*read)(struct EFI_FILE_PROTOCOL *self, UINTN *size,
+                       void *buffer);
+};
+
+struct EFI_SIMPLE_FILE_SYSTEM_PROTOCOL {
+    uint64_t revision;
+    EFI_STATUS (*open_volume)(struct EFI_SIMPLE_FILE_SYSTEM_PROTOCOL *self,
+                              struct EFI_FILE_PROTOCOL **root);
+};
+
 typedef EFI_STATUS (*EFI_LOCATE_PROTOCOL)(
     EFI_GUID *protocol, void *registration, void **iface);
 
@@ -135,94 +153,67 @@ __attribute__((noreturn)) static void halt(void) {
     }
 }
 
+__attribute__((noreturn)) static void fail(
+    struct EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *out, const CHAR16 *what,
+    EFI_STATUS status) {
+    print(out, what);
+    print(out, L" failed: ");
+    print_hex(out, status);
+    print(out, L"\r\n");
+    halt();
+}
+
 EFI_STATUS efi_main(EFI_HANDLE image_handle,
                     struct EFI_SYSTEM_TABLE *system_table) {
+    (void)image_handle;
+
     struct EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *out = system_table->con_out;
     struct EFI_BOOT_SERVICES *bs = system_table->boot_services;
 
-    static EFI_GUID gop_guid = {
-        0x9042a9de, 0x23dc, 0x4a38,
-        {0x96, 0xfb, 0x7a, 0xde, 0xd0, 0x80, 0x51, 0x6a}};
+    static EFI_GUID fs_guid = {
+        0x964e5b22, 0x6459, 0x11d2,
+        {0x8e, 0x39, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b}};
 
-    EFI_GRAPHICS_OUTPUT_PROTOCOL *gop = 0;
-    EFI_STATUS status = bs->locate_protocol(&gop_guid, 0, (void **)&gop);
+    struct EFI_SIMPLE_FILE_SYSTEM_PROTOCOL *fs = 0;
+    EFI_STATUS status = bs->locate_protocol(&fs_guid, 0, (void **)&fs);
     if (status != 0) {
-        print(out, L"No graphics output: ");
-        print_hex(out, status);
-        print(out, L"\r\n");
-        halt();
+        fail(out, L"locate file system", status);
     }
 
-    EFI_GRAPHICS_OUTPUT_PROTOCOL_MODE *mode = gop->mode;
-
-    /* Copy what we need out of firmware's structs while we still can. */
-    uint32_t *fb = (uint32_t *)mode->frame_buffer_base;
-    uint32_t width = mode->info->horizontal_resolution;
-    uint32_t height = mode->info->vertical_resolution;
-    uint32_t stride = mode->info->pixels_per_scan_line;
-
-    /* Before exit: navy screen with an orange rectangle. */
-    for (uint32_t y = 0; y < height; y++) {
-        for (uint32_t x = 0; x < width; x++) {
-            fb[y * stride + x] = 0x00102040;
-        }
-    }
-    for (uint32_t y = 300; y < 500; y++) {
-        for (uint32_t x = 440; x < 840; x++) {
-            fb[y * stride + x] = 0x00FF8800;
-        }
-    }
-
-    /* Get the memory map: first call only learns the size. */
-    UINTN map_size = 0;
-    UINTN map_key = 0;
-    UINTN desc_size = 0;
-    uint32_t desc_version = 0;
-
-    bs->get_memory_map(&map_size, 0, &map_key, &desc_size, &desc_version);
-
-    UINTN buf_size = map_size + 2 * desc_size;
-    void *map = 0;
-    status = bs->allocate_pool(2, buf_size, &map);
+    struct EFI_FILE_PROTOCOL *root = 0;
+    status = fs->open_volume(fs, &root);
     if (status != 0) {
-        print(out, L"allocate_pool failed: ");
-        print_hex(out, status);
-        print(out, L"\r\n");
-        halt();
+        fail(out, L"open volume", status);
     }
 
-    /* Fetch the map and exit immediately. Retry if the map went stale. */
-    int exited = 0;
-    for (int tries = 0; tries < 5 && !exited; tries++) {
-        map_size = buf_size;
-        status = bs->get_memory_map(&map_size, map, &map_key,
-                                    &desc_size, &desc_version);
-        if (status != 0) {
-            print(out, L"get_memory_map failed: ");
-            print_hex(out, status);
-            print(out, L"\r\n");
-            halt();
-        }
-        status = bs->exit_boot_services(image_handle, map_key);
-        if (status == 0) {
-            exited = 1;
-        }
+    struct EFI_FILE_PROTOCOL *kfile = 0;
+    status = root->open(root, &kfile, L"kernel.elf", 1, 0);
+    if (status != 0) {
+        fail(out, L"open kernel.elf", status);
     }
 
-    if (!exited) {
-        print(out, L"ExitBootServices failed: ");
-        print_hex(out, status);
-        print(out, L"\r\n");
-        halt();
+    uint64_t header = 0;
+    UINTN size = sizeof(header);
+    status = kfile->read(kfile, &size, &header);
+    if (status != 0) {
+        fail(out, L"read kernel.elf", status);
     }
 
-    /* Boot services are gone. No print(), no firmware calls, only us
-       and the framebuffer. Draw a green rectangle as proof. */
-    for (uint32_t y = 300; y < 500; y++) {
-        for (uint32_t x = 900; x < 1100; x++) {
-            fb[y * stride + x] = 0x0000CC44;
-        }
+    print(out, L"Read ");
+    print_u64(out, size);
+    print(out, L" bytes: ");
+    print_hex(out, header);
+    print(out, L"\r\n");
+
+    uint8_t *b = (uint8_t *)&header;
+    if (b[0] == 0x7F && b[1] == 'E' && b[2] == 'L' && b[3] == 'F') {
+        print(out, L"ELF magic: OK\r\n");
+    } else {
+        print(out, L"ELF magic: BAD\r\n");
     }
+
+    kfile->close(kfile);
+    root->close(root);
 
     halt();
 }
