@@ -61,15 +61,27 @@ typedef struct {
 typedef EFI_STATUS (*EFI_LOCATE_PROTOCOL)(
     EFI_GUID *protocol, void *registration, void **iface);
 
+typedef EFI_STATUS (*EFI_GET_MEMORY_MAP)(
+    UINTN *map_size, void *map, UINTN *map_key,
+    UINTN *descriptor_size, uint32_t *descriptor_version);
+
+typedef EFI_STATUS (*EFI_ALLOCATE_POOL)(
+    uint32_t pool_type, UINTN size, void **buffer);
+
+typedef EFI_STATUS (*EFI_EXIT_BOOT_SERVICES)(
+    EFI_HANDLE image_handle, UINTN map_key);
+
 struct EFI_BOOT_SERVICES {
     EFI_TABLE_HEADER hdr;
     void *raise_tpl;
     void *restore_tpl;
     void *allocate_pages;
     void *free_pages;
-    void *get_memory_map;
-    void *allocate_pool;
-    void *unused[31]; /* free_pool ... locate_handle_buffer */
+    EFI_GET_MEMORY_MAP get_memory_map;
+    EFI_ALLOCATE_POOL allocate_pool;
+    void *unused1[20]; /* free_pool ... unload_image */
+    EFI_EXIT_BOOT_SERVICES exit_boot_services;
+    void *unused2[10]; /* get_next_monotonic_count ... locate_handle_buffer */
     EFI_LOCATE_PROTOCOL locate_protocol;
 };
 
@@ -125,8 +137,6 @@ __attribute__((noreturn)) static void halt(void) {
 
 EFI_STATUS efi_main(EFI_HANDLE image_handle,
                     struct EFI_SYSTEM_TABLE *system_table) {
-    (void)image_handle;
-
     struct EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *out = system_table->con_out;
     struct EFI_BOOT_SERVICES *bs = system_table->boot_services;
 
@@ -145,36 +155,72 @@ EFI_STATUS efi_main(EFI_HANDLE image_handle,
 
     EFI_GRAPHICS_OUTPUT_PROTOCOL_MODE *mode = gop->mode;
 
-    print(out, L"Resolution: ");
-    print_u64(out, mode->info->horizontal_resolution);
-    print(out, L" x ");
-    print_u64(out, mode->info->vertical_resolution);
-    print(out, L"\r\nPixel format: ");
-    print_u64(out, mode->info->pixel_format);
-    print(out, L"\r\nPixels per scanline: ");
-    print_u64(out, mode->info->pixels_per_scan_line);
-    print(out, L"\r\nFramebuffer at: ");
-    print_hex(out, mode->frame_buffer_base);
-    print(out, L"\r\nFramebuffer size: ");
-    print_u64(out, mode->frame_buffer_size);
-    print(out, L" bytes\r\n");
-
+    /* Copy what we need out of firmware's structs while we still can. */
     uint32_t *fb = (uint32_t *)mode->frame_buffer_base;
     uint32_t width = mode->info->horizontal_resolution;
     uint32_t height = mode->info->vertical_resolution;
     uint32_t stride = mode->info->pixels_per_scan_line;
 
-    /* Fill the whole screen with dark navy. */
+    /* Before exit: navy screen with an orange rectangle. */
     for (uint32_t y = 0; y < height; y++) {
         for (uint32_t x = 0; x < width; x++) {
             fb[y * stride + x] = 0x00102040;
         }
     }
-
-    /* Draw an orange rectangle, 400 wide and 200 tall, in the middle. */
     for (uint32_t y = 300; y < 500; y++) {
         for (uint32_t x = 440; x < 840; x++) {
             fb[y * stride + x] = 0x00FF8800;
+        }
+    }
+
+    /* Get the memory map: first call only learns the size. */
+    UINTN map_size = 0;
+    UINTN map_key = 0;
+    UINTN desc_size = 0;
+    uint32_t desc_version = 0;
+
+    bs->get_memory_map(&map_size, 0, &map_key, &desc_size, &desc_version);
+
+    UINTN buf_size = map_size + 2 * desc_size;
+    void *map = 0;
+    status = bs->allocate_pool(2, buf_size, &map);
+    if (status != 0) {
+        print(out, L"allocate_pool failed: ");
+        print_hex(out, status);
+        print(out, L"\r\n");
+        halt();
+    }
+
+    /* Fetch the map and exit immediately. Retry if the map went stale. */
+    int exited = 0;
+    for (int tries = 0; tries < 5 && !exited; tries++) {
+        map_size = buf_size;
+        status = bs->get_memory_map(&map_size, map, &map_key,
+                                    &desc_size, &desc_version);
+        if (status != 0) {
+            print(out, L"get_memory_map failed: ");
+            print_hex(out, status);
+            print(out, L"\r\n");
+            halt();
+        }
+        status = bs->exit_boot_services(image_handle, map_key);
+        if (status == 0) {
+            exited = 1;
+        }
+    }
+
+    if (!exited) {
+        print(out, L"ExitBootServices failed: ");
+        print_hex(out, status);
+        print(out, L"\r\n");
+        halt();
+    }
+
+    /* Boot services are gone. No print(), no firmware calls, only us
+       and the framebuffer. Draw a green rectangle as proof. */
+    for (uint32_t y = 300; y < 500; y++) {
+        for (uint32_t x = 900; x < 1100; x++) {
+            fb[y * stride + x] = 0x0000CC44;
         }
     }
 
