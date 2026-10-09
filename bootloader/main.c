@@ -89,11 +89,15 @@ typedef EFI_STATUS (*EFI_ALLOCATE_POOL)(
 typedef EFI_STATUS (*EFI_EXIT_BOOT_SERVICES)(
     EFI_HANDLE image_handle, UINTN map_key);
 
+typedef EFI_STATUS (*EFI_ALLOCATE_PAGES)(
+    uint32_t alloc_type, uint32_t memory_type, UINTN pages,
+    uint64_t *memory);
+
 struct EFI_BOOT_SERVICES {
     EFI_TABLE_HEADER hdr;
     void *raise_tpl;
     void *restore_tpl;
-    void *allocate_pages;
+    EFI_ALLOCATE_PAGES allocate_pages;
     void *free_pages;
     EFI_GET_MEMORY_MAP get_memory_map;
     EFI_ALLOCATE_POOL allocate_pool;
@@ -285,6 +289,55 @@ EFI_STATUS efi_main(EFI_HANDLE image_handle,
         print(out, L"  memsz ");
         print_u64(out, ph->p_memsz);
         print(out, L"\r\n");
+    }
+
+    /* Load every PT_LOAD segment to its physical address. */
+    for (uint16_t i = 0; i < eh->e_phnum; i++) {
+        Elf64_Phdr *ph = (Elf64_Phdr *)((uint8_t *)file_buf + eh->e_phoff +
+                                        (uint64_t)i * eh->e_phentsize);
+        if (ph->p_type != 1) {
+            continue;
+        }
+        if (ph->p_filesz > ph->p_memsz) {
+            fail(out, L"segment filesz > memsz", i);
+        }
+        if (ph->p_offset > size || ph->p_filesz > size - ph->p_offset) {
+            fail(out, L"segment data outside file", i);
+        }
+
+        uint64_t base = ph->p_paddr & ~0xFFFULL;
+        uint64_t end = ph->p_paddr + ph->p_memsz;
+        uint64_t pages = (end - base + 0xFFF) / 0x1000;
+
+        /* alloc_type 2 = AllocateAddress, memory_type 2 = EfiLoaderData */
+        uint64_t addr = base;
+        status = bs->allocate_pages(2, 2, pages, &addr);
+        if (status != 0) {
+            fail(out, L"allocate segment pages", status);
+        }
+
+        uint8_t *dst = (uint8_t *)ph->p_paddr;
+        uint8_t *src = (uint8_t *)file_buf + ph->p_offset;
+
+        for (uint64_t n = 0; n < ph->p_filesz; n++) {
+            dst[n] = src[n];
+        }
+        for (uint64_t n = ph->p_filesz; n < ph->p_memsz; n++) {
+            dst[n] = 0;
+        }
+
+        int ok = 1;
+        for (uint64_t n = 0; n < ph->p_filesz; n++) {
+            if (dst[n] != src[n]) {
+                ok = 0;
+            }
+        }
+
+        print(out, L"Loaded segment at ");
+        print_hex(out, ph->p_paddr);
+        print(out, L", pages ");
+        print_u64(out, pages);
+        print(out, ok ? L", copy check: OK\r\n" : L", copy check: BAD\r\n");
     }
 
     halt();
