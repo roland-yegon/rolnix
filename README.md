@@ -11,6 +11,10 @@ rolnix boots a machine with no help from GRUB, no vendored UEFI libraries, and n
 
 > rolnix is an early-stage educational and experimental project. It is **not** usable as an operating system yet. See [Status](#status) for exactly what works.
 
+![rolnix booting in QEMU with the kernel filling the screen purple](docs/boot.png)
+
+*The kernel running in QEMU. The bootloader draws nothing at this stage. Every purple pixel is written by kernel code.*
+
 ---
 
 ## Table of contents
