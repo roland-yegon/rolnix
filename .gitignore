@@ -1,0 +1,22 @@
+# Build outputs
+*.o
+*.obj
+*.elf
+*.bin
+*.iso
+*.img
+build/
+bootloader/esp/EFI/BOOT/BOOTX64.EFI
+
+# QEMU's writable copy of the UEFI variable store
+OVMF_VARS*.fd
+
+# clangd index cache
+.cache/
+
+# Editor and OS junk
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
