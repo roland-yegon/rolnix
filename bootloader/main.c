@@ -117,6 +117,34 @@ struct EFI_SYSTEM_TABLE {
     struct EFI_BOOT_SERVICES *boot_services;
 };
 
+typedef struct {
+    uint8_t  e_ident[16];
+    uint16_t e_type;
+    uint16_t e_machine;
+    uint32_t e_version;
+    uint64_t e_entry;
+    uint64_t e_phoff;
+    uint64_t e_shoff;
+    uint32_t e_flags;
+    uint16_t e_ehsize;
+    uint16_t e_phentsize;
+    uint16_t e_phnum;
+    uint16_t e_shentsize;
+    uint16_t e_shnum;
+    uint16_t e_shstrndx;
+} Elf64_Ehdr;
+
+typedef struct {
+    uint32_t p_type;
+    uint32_t p_flags;
+    uint64_t p_offset;
+    uint64_t p_vaddr;
+    uint64_t p_paddr;
+    uint64_t p_filesz;
+    uint64_t p_memsz;
+    uint64_t p_align;
+} Elf64_Phdr;
+
 static void print(struct EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *out,
                   const CHAR16 *s) {
     out->output_string(out, s);
@@ -192,28 +220,72 @@ EFI_STATUS efi_main(EFI_HANDLE image_handle,
         fail(out, L"open kernel.elf", status);
     }
 
-    uint64_t header = 0;
-    UINTN size = sizeof(header);
-    status = kfile->read(kfile, &size, &header);
+    UINTN buf_size = 65536;
+    void *file_buf = 0;
+    status = bs->allocate_pool(2, buf_size, &file_buf);
+    if (status != 0) {
+        fail(out, L"allocate file buffer", status);
+    }
+
+    UINTN size = buf_size;
+    status = kfile->read(kfile, &size, file_buf);
     if (status != 0) {
         fail(out, L"read kernel.elf", status);
     }
 
-    print(out, L"Read ");
-    print_u64(out, size);
-    print(out, L" bytes: ");
-    print_hex(out, header);
-    print(out, L"\r\n");
-
-    uint8_t *b = (uint8_t *)&header;
-    if (b[0] == 0x7F && b[1] == 'E' && b[2] == 'L' && b[3] == 'F') {
-        print(out, L"ELF magic: OK\r\n");
-    } else {
-        print(out, L"ELF magic: BAD\r\n");
-    }
-
     kfile->close(kfile);
     root->close(root);
+
+    print(out, L"Read ");
+    print_u64(out, size);
+    print(out, L" bytes\r\n");
+
+    /* Never trust the file: check everything before following it. */
+    if (size < sizeof(Elf64_Ehdr)) {
+        fail(out, L"file too small for ELF header", size);
+    }
+
+    Elf64_Ehdr *eh = (Elf64_Ehdr *)file_buf;
+
+    if (eh->e_ident[0] != 0x7F || eh->e_ident[1] != 'E' ||
+        eh->e_ident[2] != 'L' || eh->e_ident[3] != 'F') {
+        fail(out, L"ELF magic", 0);
+    }
+    if (eh->e_ident[4] != 2) {
+        fail(out, L"not ELF64", eh->e_ident[4]);
+    }
+    if (eh->e_machine != 62) {
+        fail(out, L"not x86-64", eh->e_machine);
+    }
+    if (eh->e_type != 2) {
+        fail(out, L"not an EXEC file", eh->e_type);
+    }
+    if (eh->e_phoff + (uint64_t)eh->e_phnum * eh->e_phentsize > size) {
+        fail(out, L"program headers outside file", eh->e_phoff);
+    }
+
+    print(out, L"Entry point: ");
+    print_hex(out, eh->e_entry);
+    print(out, L"\r\nProgram headers: ");
+    print_u64(out, eh->e_phnum);
+    print(out, L"\r\n");
+
+    for (uint16_t i = 0; i < eh->e_phnum; i++) {
+        Elf64_Phdr *ph = (Elf64_Phdr *)((uint8_t *)file_buf + eh->e_phoff +
+                                        (uint64_t)i * eh->e_phentsize);
+
+        print(out, L"  type ");
+        print_hex(out, ph->p_type);
+        print(out, L"  offset ");
+        print_hex(out, ph->p_offset);
+        print(out, L"\r\n        paddr ");
+        print_hex(out, ph->p_paddr);
+        print(out, L"  filesz ");
+        print_u64(out, ph->p_filesz);
+        print(out, L"  memsz ");
+        print_u64(out, ph->p_memsz);
+        print(out, L"\r\n");
+    }
 
     halt();
 }
