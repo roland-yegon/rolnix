@@ -13,6 +13,13 @@ typedef struct {
     uint32_t reserved;
 } EFI_TABLE_HEADER;
 
+typedef struct {
+    uint32_t data1;
+    uint16_t data2;
+    uint16_t data3;
+    uint8_t data4[8];
+} EFI_GUID;
+
 struct EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL;
 
 typedef EFI_STATUS (*EFI_TEXT_RESET)(
@@ -27,20 +34,32 @@ struct EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL {
 };
 
 typedef struct {
-    uint32_t type;
-    uint32_t pad;
-    uint64_t physical_start;
-    uint64_t virtual_start;
-    uint64_t number_of_pages;
-    uint64_t attribute;
-} EFI_MEMORY_DESCRIPTOR;
+    uint32_t version;
+    uint32_t horizontal_resolution;
+    uint32_t vertical_resolution;
+    uint32_t pixel_format;
+    uint32_t pixel_information[4];
+    uint32_t pixels_per_scan_line;
+} EFI_GRAPHICS_OUTPUT_MODE_INFORMATION;
 
-typedef EFI_STATUS (*EFI_GET_MEMORY_MAP)(
-    UINTN *map_size, void *map, UINTN *map_key,
-    UINTN *descriptor_size, uint32_t *descriptor_version);
+typedef struct {
+    uint32_t max_mode;
+    uint32_t mode;
+    EFI_GRAPHICS_OUTPUT_MODE_INFORMATION *info;
+    UINTN size_of_info;
+    uint64_t frame_buffer_base;
+    UINTN frame_buffer_size;
+} EFI_GRAPHICS_OUTPUT_PROTOCOL_MODE;
 
-typedef EFI_STATUS (*EFI_ALLOCATE_POOL)(
-    uint32_t pool_type, UINTN size, void **buffer);
+typedef struct {
+    void *query_mode;
+    void *set_mode;
+    void *blt;
+    EFI_GRAPHICS_OUTPUT_PROTOCOL_MODE *mode;
+} EFI_GRAPHICS_OUTPUT_PROTOCOL;
+
+typedef EFI_STATUS (*EFI_LOCATE_PROTOCOL)(
+    EFI_GUID *protocol, void *registration, void **iface);
 
 struct EFI_BOOT_SERVICES {
     EFI_TABLE_HEADER hdr;
@@ -48,8 +67,10 @@ struct EFI_BOOT_SERVICES {
     void *restore_tpl;
     void *allocate_pages;
     void *free_pages;
-    EFI_GET_MEMORY_MAP get_memory_map;
-    EFI_ALLOCATE_POOL allocate_pool;
+    void *get_memory_map;
+    void *allocate_pool;
+    void *unused[31]; /* free_pool ... locate_handle_buffer */
+    EFI_LOCATE_PROTOCOL locate_protocol;
 };
 
 struct EFI_SYSTEM_TABLE {
@@ -109,54 +130,52 @@ EFI_STATUS efi_main(EFI_HANDLE image_handle,
     struct EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *out = system_table->con_out;
     struct EFI_BOOT_SERVICES *bs = system_table->boot_services;
 
-    UINTN map_size = 0;
-    UINTN map_key = 0;
-    UINTN desc_size = 0;
-    uint32_t desc_version = 0;
+    static EFI_GUID gop_guid = {
+        0x9042a9de, 0x23dc, 0x4a38,
+        {0x96, 0xfb, 0x7a, 0xde, 0xd0, 0x80, 0x51, 0x6a}};
 
-    /* Call 1: learn how big the map is (expected to "fail"). */
-    bs->get_memory_map(&map_size, 0, &map_key, &desc_size, &desc_version);
-
-    /* Pad for the entries our own allocation will add. */
-    map_size += 2 * desc_size;
-
-    /* Pool type 2 = EfiLoaderData, the right type for bootloader data. */
-    void *map = 0;
-    EFI_STATUS status = bs->allocate_pool(2, map_size, &map);
+    EFI_GRAPHICS_OUTPUT_PROTOCOL *gop = 0;
+    EFI_STATUS status = bs->locate_protocol(&gop_guid, 0, (void **)&gop);
     if (status != 0) {
-        print(out, L"allocate_pool failed: ");
+        print(out, L"No graphics output: ");
         print_hex(out, status);
         print(out, L"\r\n");
         halt();
     }
 
-    /* Call 2: the real one. */
-    status = bs->get_memory_map(&map_size, map, &map_key,
-                                &desc_size, &desc_version);
-    if (status != 0) {
-        print(out, L"get_memory_map failed: ");
-        print_hex(out, status);
-        print(out, L"\r\n");
-        halt();
+    EFI_GRAPHICS_OUTPUT_PROTOCOL_MODE *mode = gop->mode;
+
+    print(out, L"Resolution: ");
+    print_u64(out, mode->info->horizontal_resolution);
+    print(out, L" x ");
+    print_u64(out, mode->info->vertical_resolution);
+    print(out, L"\r\nPixel format: ");
+    print_u64(out, mode->info->pixel_format);
+    print(out, L"\r\nPixels per scanline: ");
+    print_u64(out, mode->info->pixels_per_scan_line);
+    print(out, L"\r\nFramebuffer at: ");
+    print_hex(out, mode->frame_buffer_base);
+    print(out, L"\r\nFramebuffer size: ");
+    print_u64(out, mode->frame_buffer_size);
+    print(out, L" bytes\r\n");
+
+    uint32_t *fb = (uint32_t *)mode->frame_buffer_base;
+    uint32_t width = mode->info->horizontal_resolution;
+    uint32_t height = mode->info->vertical_resolution;
+    uint32_t stride = mode->info->pixels_per_scan_line;
+
+    /* Fill the whole screen with dark navy. */
+    for (uint32_t y = 0; y < height; y++) {
+        for (uint32_t x = 0; x < width; x++) {
+            fb[y * stride + x] = 0x00102040;
+        }
     }
 
-    UINTN count = map_size / desc_size;
-    print(out, L"Memory map entries: ");
-    print_u64(out, count);
-    print(out, L"\r\n");
-
-    for (UINTN i = 0; i < 10 && i < count; i++) {
-        EFI_MEMORY_DESCRIPTOR *d =
-            (EFI_MEMORY_DESCRIPTOR *)((uint8_t *)map + i * desc_size);
-
-        print_u64(out, i);
-        print(out, L"  type ");
-        print_u64(out, d->type);
-        print(out, L"  start ");
-        print_hex(out, d->physical_start);
-        print(out, L"  pages ");
-        print_u64(out, d->number_of_pages);
-        print(out, L"\r\n");
+    /* Draw an orange rectangle, 400 wide and 200 tall, in the middle. */
+    for (uint32_t y = 300; y < 500; y++) {
+        for (uint32_t x = 440; x < 840; x++) {
+            fb[y * stride + x] = 0x00FF8800;
+        }
     }
 
     halt();
